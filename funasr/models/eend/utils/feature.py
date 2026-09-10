@@ -12,6 +12,13 @@ def get_input_dim(
     context_size,
     transform_type,
 ):
+    """Get input dim.
+    
+        Args:
+            frame_size: Size/dimension parameter.
+            context_size: Size/dimension parameter.
+            transform_type: TODO.
+        """
     if transform_type.startswith("logmel23"):
         frame_size = 23
     elif transform_type.startswith("logmel"):
@@ -28,7 +35,7 @@ def transform(Y, transform_type=None, dtype=np.float32):
 
     Args:
         Y: STFT
-            (n_frames, n_bins)-shaped np.complex array
+            (n_frames, n_bins)-shaped complex array
         transform_type:
             None, "log"
         dtype: output data type
@@ -45,21 +52,21 @@ def transform(Y, transform_type=None, dtype=np.float32):
         n_fft = 2 * (Y.shape[1] - 1)
         sr = 16000
         n_mels = 40
-        mel_basis = librosa.filters.mel(sr, n_fft, n_mels)
+        mel_basis = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels)
         Y = np.dot(Y**2, mel_basis.T)
         Y = np.log10(np.maximum(Y, 1e-10))
     elif transform_type == "logmel23":
         n_fft = 2 * (Y.shape[1] - 1)
         sr = 8000
         n_mels = 23
-        mel_basis = librosa.filters.mel(sr, n_fft, n_mels)
+        mel_basis = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels)
         Y = np.dot(Y**2, mel_basis.T)
         Y = np.log10(np.maximum(Y, 1e-10))
     elif transform_type == "logmel23_mn":
         n_fft = 2 * (Y.shape[1] - 1)
         sr = 8000
         n_mels = 23
-        mel_basis = librosa.filters.mel(sr, n_fft, n_mels)
+        mel_basis = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels)
         Y = np.dot(Y**2, mel_basis.T)
         Y = np.log10(np.maximum(Y, 1e-10))
         mean = np.mean(Y, axis=0)
@@ -68,7 +75,7 @@ def transform(Y, transform_type=None, dtype=np.float32):
         n_fft = 2 * (Y.shape[1] - 1)
         sr = 8000
         n_mels = 23
-        mel_basis = librosa.filters.mel(sr, n_fft, n_mels)
+        mel_basis = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels)
         Y = np.dot(Y**2, mel_basis.T)
         Y = np.log10(np.maximum(Y, 1e-10))
         # b = np.ones(300)/300
@@ -85,7 +92,7 @@ def transform(Y, transform_type=None, dtype=np.float32):
         n_fft = 2 * (Y.shape[1] - 1)
         sr = 8000
         n_mels = 23
-        mel_basis = librosa.filters.mel(sr, n_fft, n_mels)
+        mel_basis = librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=n_mels)
         Y = np.dot(Y**2, mel_basis.T)
         Y = np.log10(np.maximum(Y, 1e-10))
         mean = np.mean(Y, axis=0)
@@ -155,6 +162,13 @@ def stft(data, frame_size=1024, frame_shift=256):
 
 def _count_frames(data_len, size, shift):
     # HACK: Assuming librosa.stft(..., center=True)
+    """Internal: count frames.
+    
+        Args:
+            data_len: TODO.
+            size: TODO.
+            shift: TODO.
+        """
     n_frames = 1 + int(data_len / shift)
     if data_len % shift == 0:
         n_frames = n_frames - 1

@@ -6,13 +6,16 @@ import logging
 from tqdm import tqdm
 from datetime import datetime
 import torch.distributed as dist
-from torch.cuda.amp import autocast, GradScaler
+from funasr.utils.amp import autocast, GradScaler
 from contextlib import nullcontext, contextmanager
 from pathlib import Path
 
 from funasr.train_utils.device_funcs import to_device
 from funasr.train_utils.recursive_op import recursive_average
 from funasr.train_utils.average_nbest_models import average_checkpoints
+from funasr.train_utils.checkpoint_metrics import (
+    ValidationMetrics, check_resume_ranking, record_validation_metrics,
+)
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 
 try:
@@ -22,9 +25,15 @@ except:
 
 
 @contextmanager
-def maybe_autocast(enabled):
+def maybe_autocast(enabled, dtype=None):
+    """Context manager for mixed precision training.
+    
+    Args:
+        enabled: Whether to enable autocast.
+        dtype: torch.float16 or torch.bfloat16. If None, defaults to float16.
+    """
     if enabled:
-        with autocast():
+        with autocast(dtype=dtype):
             yield
     else:
         yield
@@ -52,6 +61,7 @@ class Trainer:
         use_ddp: bool = False,
         use_fsdp: bool = False,
         use_fp16: bool = False,
+        use_bf16: bool = False,
         output_dir: str = "./",
         **kwargs,
     ):
@@ -84,6 +94,9 @@ class Trainer:
         self.log_interval = kwargs.get("log_interval", 50)
         self.batch_total = 0
         self.use_fp16 = use_fp16
+        self.use_bf16 = use_bf16
+        self.amp_enabled = use_fp16 or use_bf16
+        self.amp_dtype = torch.bfloat16 if use_bf16 else (torch.float16 if use_fp16 else None)
         self.save_checkpoint_interval = kwargs.get("save_checkpoint_interval", 5000)
         self.validate_interval = kwargs.get("validate_interval", -1)
         if self.validate_interval < 0:
@@ -117,6 +130,7 @@ class Trainer:
         self.best_step_or_epoch = ""
         self.val_acc_step_or_epoch = {}
         self.val_loss_step_or_epoch = {}
+        self._warned_validation_metric = False
 
         self.reset_gpu_cache = kwargs.get("reset_gpu_cache", False)
         self.start_data_split_i = 0
@@ -192,62 +206,91 @@ class Trainer:
             else:
                 ckpt_name = f"model.pt.ep{epoch}.{step}"
             filename = os.path.join(self.output_dir, ckpt_name)
-            torch.save(state, filename)
-            logging.info(f"Checkpoint saved to {filename}")
-
             latest = Path(os.path.join(self.output_dir, f"model.pt"))
-            torch.save(state, latest)
+            write_best = False
+            prune_path = None
 
-            if self.best_step_or_epoch == "":
+            if self.best_step_or_epoch == "" and ckpt_name in getattr(
+                self, f"val_{self.avg_keep_nbest_models_type}_step_or_epoch"
+            ):
                 self.best_step_or_epoch = ckpt_name
 
             if self.avg_keep_nbest_models_type == "acc":
-                if (
-                    self.val_acc_step_or_epoch[ckpt_name]
-                    >= self.val_acc_step_or_epoch[self.best_step_or_epoch]
-                ):
+                cur_acc = self.val_acc_step_or_epoch.get(ckpt_name)
+                best_acc = self.val_acc_step_or_epoch.get(self.best_step_or_epoch)
+                if cur_acc is not None and (best_acc is None or cur_acc >= best_acc):
                     self.best_step_or_epoch = ckpt_name
                     best_ckpt = Path(os.path.join(self.output_dir, f"model.pt.best"))
-                    torch.save(state, best_ckpt)
+                    write_best = True
                     logging.info(
-                        f"Update best acc: {self.val_acc_step_or_epoch[self.best_step_or_epoch]:.4f}, {best_ckpt}"
+                        f"Update best acc: {cur_acc:.4f}, {best_ckpt}"
+                    )
+                elif cur_acc is None:
+                    logging.info(
+                        f"Checkpoint {ckpt_name} saved at a step with no validation acc yet; not considered for best."
                     )
                 else:
                     logging.info(
-                        f"No improvement in acc: {self.val_acc_step_or_epoch[ckpt_name]:.4f} < {self.val_acc_step_or_epoch[self.best_step_or_epoch]:.4f}, {os.path.join(self.output_dir, self.best_step_or_epoch)}"
+                        f"No improvement in acc: {cur_acc:.4f} < {best_acc:.4f}, {os.path.join(self.output_dir, self.best_step_or_epoch)}"
                     )
             elif self.avg_keep_nbest_models_type == "loss":
-                if (
-                    self.val_loss_step_or_epoch[ckpt_name]
-                    <= self.val_loss_step_or_epoch[self.best_step_or_epoch]
-                ):
+                cur_loss = self.val_loss_step_or_epoch.get(ckpt_name)
+                best_loss = self.val_loss_step_or_epoch.get(self.best_step_or_epoch)
+                if cur_loss is not None and (best_loss is None or cur_loss <= best_loss):
                     self.best_step_or_epoch = ckpt_name
                     best_ckpt = Path(os.path.join(self.output_dir, f"model.pt.best"))
-                    torch.save(state, best_ckpt)
+                    write_best = True
                     logging.info(
-                        f"Update best loss: {self.val_loss_step_or_epoch[self.best_step_or_epoch]:.4f}, {best_ckpt}"
+                        f"Update best loss: {cur_loss:.4f}, {best_ckpt}"
+                    )
+                elif cur_loss is None:
+                    logging.info(
+                        f"Checkpoint {ckpt_name} saved at a step with no validation loss yet; not considered for best."
                     )
                 else:
                     logging.info(
-                        f"No improvement in loss: {self.val_loss_step_or_epoch[ckpt_name]:.4f} > {self.val_loss_step_or_epoch[self.best_step_or_epoch]:.4f}, {os.path.join(self.output_dir, self.best_step_or_epoch)}"
+                        f"No improvement in loss: {cur_loss:.4f} > {best_loss:.4f}, {os.path.join(self.output_dir, self.best_step_or_epoch)}"
                     )
             else:
                 print("Undo")
-            self.saved_ckpts[ckpt_name] = getattr(
+            # Only checkpoints carrying the configured validation metric
+            # (acc or loss) are ranked. A checkpoint saved at an unvalidated
+            # step (e.g. save_checkpoint_interval is not a multiple of
+            # validate_interval) is kept on disk but excluded from saved_ckpts,
+            # so it never competes in best-model ranking or keep_nbest_models
+            # pruning with a fabricated score and cannot evict a validated
+            # best checkpoint.
+            metric_value = getattr(
                 self, f"val_{self.avg_keep_nbest_models_type}_step_or_epoch"
-            )[ckpt_name]
-            if self.keep_nbest_models > 0:
-                if len(self.saved_ckpts) > self.keep_nbest_models:
-                    if self.avg_keep_nbest_models_type == "acc":
-                        key = min(self.saved_ckpts, key=self.saved_ckpts.get)
-                    else:
-                        key = max(self.saved_ckpts, key=self.saved_ckpts.get)
-                    if key in self.saved_ckpts:
-                        del self.saved_ckpts[key]
-                    filename = os.path.join(self.output_dir, key)
-                    logging.info(f"Delete: {filename}")
-                    if os.path.exists(filename):
-                        os.remove(filename)
+            ).get(ckpt_name)
+            if metric_value is None:
+                logging.info(
+                    f"Checkpoint {ckpt_name} has no {self.avg_keep_nbest_models_type} metric; "
+                    "kept on disk but excluded from keep_nbest_models ranking."
+                )
+            else:
+                self.saved_ckpts[ckpt_name] = metric_value
+                if self.keep_nbest_models > 0:
+                    if len(self.saved_ckpts) > self.keep_nbest_models:
+                        if self.avg_keep_nbest_models_type == "acc":
+                            key = min(self.saved_ckpts, key=self.saved_ckpts.get)
+                        else:
+                            key = max(self.saved_ckpts, key=self.saved_ckpts.get)
+                        if key in self.saved_ckpts:
+                            del self.saved_ckpts[key]
+                        prune_path = os.path.join(self.output_dir, key)
+
+            state["best_step_or_epoch"] = self.best_step_or_epoch
+            state["saved_ckpts"] = dict(self.saved_ckpts)
+            torch.save(state, filename)
+            torch.save(state, latest)
+            if write_best:
+                torch.save(state, best_ckpt)
+            logging.info(f"Checkpoint saved to {filename}")
+            # Do not delete a previous candidate before all new writes succeed.
+            if prune_path is not None and os.path.exists(prune_path):
+                logging.info(f"Delete: {prune_path}")
+                os.remove(prune_path)
 
         if self.use_ddp or self.use_fsdp:
             dist.barrier()
@@ -270,6 +313,7 @@ class Trainer:
             ckpt = os.path.join(self.output_dir, "model.pt")
             if os.path.isfile(ckpt):
                 checkpoint = torch.load(ckpt, map_location="cpu")
+                check_resume_ranking(checkpoint, self.avg_keep_nbest_models_type)
                 self.start_epoch = checkpoint["epoch"]
                 # self.model.load_state_dict(checkpoint['state_dict'])
                 src_state = checkpoint["state_dict"]
@@ -375,14 +419,14 @@ class Trainer:
             time1 = time.perf_counter()
             speed_stats["data_load"] = f"{time1-time_beg:0.3f}"
 
-            batch = to_device(batch, self.device)
+            batch = to_device(batch, self.device, non_blocking=True)
 
             my_context = nullcontext
             if self.use_ddp or self.use_fsdp:
                 my_context = model.no_sync if batch_idx % accum_grad != 0 else my_context
             with my_context():
                 time2 = time.perf_counter()
-                with maybe_autocast(self.use_fp16):
+                with maybe_autocast(self.amp_enabled, dtype=self.amp_dtype):
                     retval = model(**batch)
 
                     # if (
@@ -411,7 +455,7 @@ class Trainer:
 
                 time3 = time.perf_counter()
                 speed_stats["forward_time"] = f"{time3 - time2:0.3f}"
-                if self.use_fp16:
+                if self.use_fp16 and scaler is not None:
                     scaler.scale(loss).backward()
                 else:
                     loss.backward()
@@ -447,7 +491,7 @@ class Trainer:
                 # Execute an optimization step (update model parameters)
                 if self.use_ddp or self.use_fsdp:
                     dist.barrier()
-                if self.use_fp16:
+                if self.use_fp16 and scaler is not None:
                     scaler.step(optim)
                     scaler.update()
                 else:
@@ -456,7 +500,7 @@ class Trainer:
                 # Clear gradients for the next accumulation stage
                 optim.zero_grad(set_to_none=True)
 
-                if self.use_ddp or self.use_fsdp:
+                if (self.use_ddp or self.use_fsdp) and (batch_idx + 1) % self.log_interval == 0:
                     train_loss_avg = torch.tensor(self.train_loss_avg, dtype=torch.float32).to(
                         self.device
                     )
@@ -548,6 +592,7 @@ class Trainer:
             dist.barrier()
         logging.info(f"Validate epoch: {epoch}, rank: {self.rank}\n")
         model.eval()
+        metrics = ValidationMetrics()
 
         with torch.no_grad():
 
@@ -562,7 +607,7 @@ class Trainer:
                         break
                 time1 = time.perf_counter()
                 speed_stats["data_load"] = f"{time1 - time5:0.3f}"
-                batch = to_device(batch, self.device)
+                batch = to_device(batch, self.device, non_blocking=True)
 
                 time2 = time.perf_counter()
                 retval = model(**batch)
@@ -588,27 +633,10 @@ class Trainer:
                 loss = loss
                 time4 = time.perf_counter()
 
-                if torch.isfinite(loss):
-                    self.val_loss_avg = (
-                        self.val_loss_avg * batch_idx + loss.detach().cpu().item()
-                    ) / (batch_idx + 1)
-
-                    if "acc" in stats:
-                        self.val_acc_avg = (
-                            self.val_acc_avg * batch_idx + stats["acc"].detach().cpu().item()
-                        ) / (batch_idx + 1)
-
-                    if self.use_ddp or self.use_fsdp:
-                        val_loss_avg = torch.tensor(self.val_loss_avg, dtype=torch.float32).to(
-                            self.device
-                        )
-                        val_acc_avg = torch.tensor(self.val_acc_avg, dtype=torch.float32).to(
-                            self.device
-                        )
-                        dist.all_reduce(val_loss_avg, op=dist.ReduceOp.SUM)
-                        dist.all_reduce(val_acc_avg, op=dist.ReduceOp.SUM)
-                        self.val_loss_avg = val_loss_avg.detach().cpu().item() / self.world_size
-                        self.val_acc_avg = val_acc_avg.detach().cpu().item() / self.world_size
+                metrics.update(loss, stats)
+                running = metrics.compute(self.device)
+                self.val_loss_avg = running["loss"] if running["loss"] is not None else float("nan")
+                self.val_acc_avg = running["acc"] if running["acc"] is not None else float("nan")
 
                 time5 = time.perf_counter()
                 batch_num_epoch = 1
@@ -635,8 +663,10 @@ class Trainer:
             ckpt_name = f"model.pt.ep{epoch}"
         else:
             ckpt_name = f'model.pt.ep{epoch}.{kwargs.get("step_in_epoch")}'
-        self.val_acc_step_or_epoch[ckpt_name] = self.val_acc_avg
-        self.val_loss_step_or_epoch[ckpt_name] = self.val_loss_avg
+        record_validation_metrics(
+            self, ckpt_name,
+            metrics.compute(self.device, distributed=self.use_ddp or self.use_fsdp),
+        )
         model.train()
 
         if self.use_ddp or self.use_fsdp:
@@ -661,6 +691,24 @@ class Trainer:
         **kwargs,
     ):
 
+        """Log.
+        
+            Args:
+                epoch: TODO.
+                batch_idx: TODO.
+                step_in_epoch: TODO.
+                batch_num_epoch: TODO.
+                lr: TODO.
+                loss: TODO.
+                speed_stats: TODO.
+                stats: TODO.
+                writer: TODO.
+                tag: TODO.
+                data_split_i: TODO.
+                data_split_num: TODO.
+                log_step: TODO.
+                **kwargs: Additional keyword arguments.
+            """
         if (batch_idx + 1) % self.log_interval == 0:
             batch_idx = log_step if log_step is not None else batch_idx
             gpu_info = (
@@ -720,6 +768,11 @@ class Trainer:
 
     def close(self, writer=None):
 
+        """Close.
+        
+            Args:
+                writer: TODO.
+            """
         if self.use_ddp or self.use_fsdp:
             dist.barrier()
 

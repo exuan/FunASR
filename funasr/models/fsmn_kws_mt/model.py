@@ -6,7 +6,7 @@
 import time
 import torch
 import logging
-from torch.cuda.amp import autocast
+from funasr.utils.amp import autocast
 from typing import Union, Dict, List, Tuple, Optional
 
 from funasr.register import tables
@@ -25,7 +25,14 @@ from funasr.utils.load_utils import load_audio_text_image_video, extract_fbank
 
 @tables.register("model_classes", "FsmnKWSMT")
 class FsmnKWSMT(torch.nn.Module):
-    """
+    """FSMN-KWS-MT: Multi-Task FSMN Keyword Spotting.
+
+    Keyword spotting with multi-task learning: simultaneously
+    detects keywords and performs filler token classification.
+    Improves keyword detection robustness through auxiliary tasks.
+
+    Output: {"key": str, "value": keyword_detection_result}
+
     Author: Speech Lab of DAMO Academy, Alibaba Group
     Deep-FSMN for Large Vocabulary Continuous Speech Recognition
     https://arxiv.org/abs/1803.05030
@@ -46,6 +53,22 @@ class FsmnKWSMT(torch.nn.Module):
         blank_id: int = 0,
         **kwargs,
     ):
+        """Initialize FsmnKWSMT.
+        
+            Args:
+                specaug: TODO.
+                specaug_conf: Configuration dict for specaug.
+                normalize: TODO.
+                normalize_conf: Configuration dict for normalize.
+                encoder: TODO.
+                encoder_conf: Configuration dict for encoder.
+                ctc_conf: Configuration dict for ctc.
+                input_size: Size/dimension parameter.
+                vocab_size: Size/dimension parameter.
+                ignore_id: TODO.
+                blank_id: TODO.
+                **kwargs: Additional keyword arguments.
+            """
         super().__init__()
 
         if specaug is not None:
@@ -173,6 +196,14 @@ class FsmnKWSMT(torch.nn.Module):
         ys_pad_lens: torch.Tensor,
     ):
         # Calc CTC loss
+        """Internal: calc ctc loss.
+        
+            Args:
+                encoder_out: Encoder output tensor.
+                encoder_out_lens: Encoder output lengths.
+                ys_pad: TODO.
+                ys_pad_lens: Lengths of ys_pad.
+            """
         loss_ctc = self.ctc(encoder_out, encoder_out_lens, ys_pad, ys_pad_lens)
 
         # Calc CER using CTC
@@ -190,6 +221,14 @@ class FsmnKWSMT(torch.nn.Module):
         ys_pad_lens: torch.Tensor,
     ):
         # Calc CTC loss
+        """Internal: calc ctc2 loss.
+        
+            Args:
+                encoder_out: Encoder output tensor.
+                encoder_out_lens: Encoder output lengths.
+                ys_pad: TODO.
+                ys_pad_lens: Lengths of ys_pad.
+            """
         loss_ctc = self.ctc2(encoder_out, encoder_out_lens, ys_pad, ys_pad_lens)
 
         # Calc CER using CTC
@@ -209,6 +248,16 @@ class FsmnKWSMT(torch.nn.Module):
         frontend=None,
         **kwargs,
     ):
+        """Run inference on input data.
+        
+            Args:
+                data_in: Input data (audio samples, file paths, or text).
+                data_lengths: Lengths of each input sample in the batch.
+                key: Sample identifiers.
+                tokenizer: Tokenizer instance for text encoding/decoding.
+                frontend: Audio frontend for feature extraction.
+                **kwargs: Additional keyword arguments.
+            """
         keywords = kwargs.get("keywords")
         from funasr.utils.kws_utils import KwsCtcPrefixDecoder
         self.kws_decoder = KwsCtcPrefixDecoder(
@@ -276,22 +325,24 @@ class FsmnKWSMT(torch.nn.Module):
             is_deted, det_keyword, det_score = detect_result[0], detect_result[1], detect_result[2]
 
             if is_deted:
-                self.writer["detect"][key[i]] = "detected " + det_keyword + " " + str(det_score)
                 det_info = "detected " + det_keyword + " " + str(det_score)
             else:
-                self.writer["detect"][key[i]] = "rejected"
                 det_info = "rejected"
+
+            if kwargs.get("output_dir") is not None:
+                self.writer["detect"][key[i]] = det_info
 
             x2 = encoder_out2[i, :encoder_out_lens[i], :]
             detect_result2 = self.kws_decoder2.decode(x2)
             is_deted2, det_keyword2, det_score2 = detect_result2[0], detect_result2[1], detect_result2[2]
 
             if is_deted2:
-                self.writer["detect2"][key[i]] = "detected " + det_keyword2 + " " + str(det_score2)
                 det_info2 = "detected " + det_keyword2 + " " + str(det_score2)
             else:
-                self.writer["detect2"][key[i]] = "rejected"
                 det_info2 = "rejected"
+
+            if kwargs.get("output_dir") is not None:
+                self.writer["detect2"][key[i]] = det_info2
 
             result_i = {"key": key[i], "text": det_info, "text2": det_info2}
             results.append(result_i)
@@ -317,6 +368,17 @@ class FsmnKWSMTConvert(torch.nn.Module):
         blank_id: int = 0,
         **kwargs,
     ):
+        """Initialize FsmnKWSMTConvert.
+        
+            Args:
+                encoder: TODO.
+                encoder_conf: Configuration dict for encoder.
+                ctc_conf: Configuration dict for ctc.
+                ctc_weight: TODO.
+                input_size: Size/dimension parameter.
+                blank_id: TODO.
+                **kwargs: Additional keyword arguments.
+            """
         super().__init__()
 
         encoder_class = tables.encoder_classes.get(encoder)
@@ -328,10 +390,17 @@ class FsmnKWSMTConvert(torch.nn.Module):
         self.error_calculator = None
 
     def to_kaldi_net(self):
+        """To kaldi net."""
         return self.encoder.to_kaldi_net()
 
     def to_kaldi_net2(self):
+        """To kaldi net2."""
         return self.encoder.to_kaldi_net2()
 
     def to_pytorch_net(self, kaldi_file):
+        """To pytorch net.
+        
+            Args:
+                kaldi_file: TODO.
+            """
         return self.encoder.to_pytorch_net(kaldi_file)
